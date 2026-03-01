@@ -1,8 +1,11 @@
+import os
+import json
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 import redis.asyncio as aioredis
-import json
-import os
+from pydantic import BaseModel
 
 from .database import engine, Base, SessionLocal
 from .models import TrainingJob
@@ -14,6 +17,20 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="LLM Fine-Tuning Platform")
 
+# Разрешаем доступ со всех IP (CORS), чтобы можно было заходить с ноута
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic схема для приема данных на старт обучения
+class TrainRequest(BaseModel):
+    dataset_path: str
+    params: dict
+
 def get_db():
     db = SessionLocal()
     try:
@@ -24,61 +41,60 @@ def get_db():
 @app.post("/api/dataset/upload")
 async def upload_dataset(file: UploadFile = File(...)):
     """
-    Загрузка, валидация и сохранение сырого датасета на сервере.
+    Эндпоинт для загрузки файла через графический интерфейс.
     """
     os.makedirs("raw_data", exist_ok=True)
-    raw_path = f"raw_data/{file.filename}"
+    file_path = f"raw_data/{file.filename}"
     
-    with open(raw_path, "wb") as f:
+    with open(file_path, "wb") as f:
         content = await file.read()
         f.write(content)
-        
+    
     parser = DatasetParser()
-    is_valid, result = parser.load_and_validate(raw_path)
+    is_valid, result = parser.load_and_validate(file_path)
     
     if not is_valid:
-        os.remove(raw_path)
+        os.remove(file_path)
         raise HTTPException(status_code=400, detail=result)
         
-    return {"message": "Датасет успешно прошел валидацию", "file_path": raw_path}
+    return {"message": "Файл прошел валидацию и сохранен", "file_path": file_path}
+
+@app.get("/api/models/available")
+def list_available_models():
+    """
+    Отдает фронтенду список доступных базовых моделей.
+    """
+    return [
+        "meta-llama/Llama-2-7b-hf",
+        "mistralai/Mistral-7B-v0.1",
+        "IlyaGusev/saiga_llama3_8b"
+    ]
 
 @app.post("/api/train")
-def create_training_job(params: dict, dataset_path: str, db: Session = Depends(get_db)):
+def create_training_job(request: TrainRequest, db: Session = Depends(get_db)):
     """
-    Создание задачи на дообучение. Конвертирует сырой датасет в JSONL и кидает задачу в Celery.
+    Запускает Celery-задачу на основе параметров из веб-интерфейса.
     """
-    if not os.path.exists(dataset_path):
-        raise HTTPException(status_code=400, detail="Указанный датасет не найден.")
+    if not os.path.exists(request.dataset_path):
+        raise HTTPException(status_code=400, detail="Указанный датасет не найден на сервере.")
 
-    job = TrainingJob(model_type="local", params=params)
+    job = TrainingJob(model_type="local", params=request.params)
     db.add(job)
     db.commit()
     db.refresh(job)
     
     parser = DatasetParser()
-    _, valid_data = parser.load_and_validate(dataset_path)
+    _, valid_data = parser.load_and_validate(request.dataset_path)
     processed_path = f"processed_data/dataset_{job.id}.jsonl"
     parser.save_standardized(valid_data, processed_path)
     
     run_training_task.delay(job.id)
-    
     return {"task_id": job.id, "status": job.status}
-
-@app.get("/api/status/{task_id}")
-def get_status(task_id: int, db: Session = Depends(get_db)):
-    """
-    Проверка статического статуса задачи в БД.
-    """
-    job = db.query(TrainingJob).filter(TrainingJob.id == task_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
-        
-    return {"task_id": job.id, "status": job.status, "metrics": job.metrics}
 
 @app.websocket("/ws/metrics/{task_id}")
 async def websocket_endpoint(websocket: WebSocket, task_id: int):
     """
-    WebSocket-эндпоинт для стриминга графиков Loss и статусов из Redis напрямую на клиент.
+    Стриминг метрик из Redis прямо в браузер.
     """
     await websocket.accept()
     redis_client = await aioredis.from_url("redis://localhost:6379/0", decode_responses=True)
@@ -90,18 +106,13 @@ async def websocket_endpoint(websocket: WebSocket, task_id: int):
         async for message in pubsub.listen():
             if message["type"] == "message":
                 await websocket.send_text(message["data"])
-                
-                # Закрываем сокет, если процесс завершился или упал
-                data = json.loads(message["data"])
-                if data.get("status") in ["Completed", "Failed"]:
-                    break
     except WebSocketDisconnect:
         pass
     finally:
         await pubsub.unsubscribe(channel_name)
         await redis_client.aclose()
-        # Проверка, чтобы не закрыть уже закрытый сокет
-        try:
-            await websocket.close()
-        except RuntimeError:
-            pass
+
+# Раздача собранного фронтенда (React/Vue). 
+# Должно быть в самом конце файла, чтобы не перекрывать API роуты!
+if os.path.exists("dist"):
+    app.mount("/", StaticFiles(directory="dist", html=True), name="static")

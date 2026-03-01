@@ -1,84 +1,114 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import LossChart from './components/LossChart';
 
 export default function App() {
+    const [file, setFile] = useState<File | null>(null);
+    const [datasetPath, setDatasetPath] = useState('');
+    const [method, setMethod] = useState('lora');
+    const [baseModel, setBaseModel] = useState('meta-llama/Llama-2-7b-hf');
     const [taskId, setTaskId] = useState<number | null>(null);
-    const [status, setStatus] = useState<string>('Ожидание');
-    const [metricsData, setMetricsData] = useState<Array<{ step: number; loss: number }>>([]);
+    const [status, setStatus] = useState('Ожидание');
+    const [metrics, setMetrics] = useState<Array<{ step: number; loss: number }>>([]);
     const [error, setError] = useState<string | null>(null);
-    const wsRef = useRef<WebSocket | null>(null);
+
+    const handleUpload = async () => {
+        if (!file) return;
+        const formData = new FormData();
+        formData.append('file', file);
+        
+        try {
+            const res = await fetch('/api/dataset/upload', { 
+                method: 'POST', 
+                body: formData 
+            });
+            const data = await res.json();
+            
+            if (!res.ok) throw new Error(data.detail || 'Ошибка загрузки');
+            
+            setDatasetPath(data.file_path);
+            alert('Файл успешно загружен и прошел проверку!');
+            setError(null);
+        } catch (err: any) {
+            setError(err.message);
+        }
+    };
 
     const startTraining = async () => {
         try {
-            // Хардкод пути для примера. В реальности путь берется из ответа эндпоинта /api/dataset/upload
-            const response = await fetch('http://localhost:8000/api/train?dataset_path=processed_data/dataset.jsonl', {
+            const res = await fetch('/api/train', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ epochs: 3, batch_size: 4, lr: 0.0002 })
+                body: JSON.stringify({
+                    dataset_path: datasetPath,
+                    params: { 
+                        method: method, 
+                        model_name: baseModel, 
+                        epochs: 3, 
+                        lr: method === 'full' ? 0.00001 : 0.0002 
+                    }
+                })
             });
-            const data = await response.json();
+            const data = await res.json();
+            
+            if (!res.ok) throw new Error(data.detail || 'Ошибка запуска');
             
             setTaskId(data.task_id);
-            setStatus(data.status);
-            setMetricsData([]);
+            setStatus('Инициализация...');
+            setMetrics([]);
             setError(null);
         } catch (err: any) {
-            setError('Ошибка запуска: ' + err.message);
+            setError(err.message);
         }
     };
 
     useEffect(() => {
         if (!taskId) return;
-
-        // Подключение к WebSocket при получении ID задачи
-        const ws = new WebSocket(`ws://localhost:8000/ws/metrics/${taskId}`);
-        wsRef.current = ws;
-
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            
+        
+        // Подключаемся к вебсокету по текущему хосту, чтобы работало и локально, и на сервере
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/metrics/${taskId}`);
+        
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
             if (data.status) setStatus(data.status);
             if (data.error) setError(data.error);
-            
-            // Если пришли метрики, добавляем их в массив для графика
             if (data.loss !== undefined && data.step !== undefined) {
-                setMetricsData(prev => [...prev, { step: data.step, loss: data.loss }]);
+                setMetrics(prev => [...prev, { step: data.step, loss: data.loss }]);
             }
         };
-
-        ws.onclose = () => console.log('Соединение WebSocket закрыто');
-
-        return () => {
-            if (wsRef.current) wsRef.current.close();
-        };
+        
+        return () => ws.close();
     }, [taskId]);
 
     return (
-        <div style={{ padding: '20px', maxWidth: '800px', margin: '0 auto', fontFamily: 'sans-serif' }}>
-            <h1>Платформа Fine-Tuning LLM</h1>
+        <div style={{ padding: '40px', maxWidth: '900px', margin: '0 auto', fontFamily: 'sans-serif', backgroundColor: '#f9f9f9', minHeight: '100vh' }}>
+            <h1 style={{ textAlign: 'center', marginBottom: '40px' }}>LLM Fine-Tuning Dashboard</h1>
             
-            <div style={{ marginBottom: '20px' }}>
-                <button 
-                    onClick={startTraining} 
-                    disabled={status === 'Running'}
-                    style={{ padding: '10px 20px', fontSize: '16px', cursor: 'pointer' }}
-                >
-                    Запустить обучение
-                </button>
-            </div>
-
-            <div style={{ marginBottom: '20px', padding: '15px', border: '1px solid #ccc', borderRadius: '5px' }}>
-                <p><strong>ID задачи:</strong> {taskId || '—'}</p>
-                <p><strong>Статус:</strong> {status}</p>
-                {error && <p style={{ color: 'red' }}><strong>Ошибка:</strong> {error}</p>}
-            </div>
-
-            <h2>График обучения</h2>
-            {metricsData.length > 0 ? (
-                <LossChart data={metricsData} />
-            ) : (
-                <p style={{ color: '#666' }}>Нет данных для отображения графика. Запустите задачу.</p>
+            {error && (
+                <div style={{ padding: '15px', backgroundColor: '#ffebee', color: '#c62828', marginBottom: '20px', borderRadius: '5px' }}>
+                    <strong>Ошибка: </strong> {error}
+                </div>
             )}
-        </div>
-    );
-}
+
+            <section style={{ background: 'white', padding: '25px', borderRadius: '10px', boxShadow: '0 2px 10px rgba(0,0,0,0.05)', marginBottom: '25px' }}>
+                <h3 style={{ marginTop: 0 }}>1. Загрузка датасета (CSV/JSONL)</h3>
+                <input type="file" onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)} style={{ marginBottom: '15px', display: 'block' }} />
+                <button 
+                    onClick={handleUpload} 
+                    disabled={!file}
+                    style={{ padding: '10px 20px', cursor: file ? 'pointer' : 'not-allowed' }}
+                >
+                    Загрузить на сервер
+                </button>
+                {datasetPath && <p style={{ color: 'green', marginTop: '10px' }}>✓ Файл готов к работе: {datasetPath}</p>}
+            </section>
+
+            <section style={{ background: 'white', padding: '25px', borderRadius: '10px', boxShadow: '0 2px 10px rgba(0,0,0,0.05)', marginBottom: '25px' }}>
+                <h3 style={{ marginTop: 0 }}>2. Настройки обучения</h3>
+                
+                <div style={{ marginBottom: '15px' }}>
+                    <label style={{ display: 'block', marginBottom: '5px' }}><strong>Базовая модель:</strong></label>
+                    <select value={baseModel} onChange={(e) => setBaseModel(e.target.value)} style={{ padding: '8px', width: '100%', maxWidth: '400px' }}>
+                        <option value="meta-llama/Llama-2-7b-hf">Llama 2 (7B)</option>
+                        <option value="mistralai/Mistral-7B-v0.1">Mistral (7B)</option>
+                        <option value="IlyaGusev/
