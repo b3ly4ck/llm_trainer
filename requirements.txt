@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy
+celery
+redis
+websockets
+pandas
+transformers
+peft
+trl
+bitsandbytes
+torch
+httpx
+recharts
